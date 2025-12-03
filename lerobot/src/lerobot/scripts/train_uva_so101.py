@@ -175,6 +175,8 @@ def main():
         "task_name": "umi_so101",
         "task_modes": ["policy_model"],
         "normalizer_type": "none",
+        # Match UVA default (None -> train all modes)
+        "selected_training_mode": policy_defaults.selected_training_mode,
         "use_history_action": False,
         "use_proprioception": False,
         "predict_wrist_img": False,
