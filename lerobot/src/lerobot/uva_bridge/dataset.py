@@ -19,14 +19,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Sequence
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+
+# UVA's default image size expected by the MAR model
+UVA_DEFAULT_IMAGE_SIZE = 256
 
 
 def _default_image_indices() -> list[int]:
@@ -35,8 +39,11 @@ def _default_image_indices() -> list[int]:
 
 
 def _default_action_indices() -> list[int]:
-    # 32 points spanning the same window as images but at unit stride.
-    return list(range(-15, 17))
+    # UVA's DiffActLoss expects exactly 16 action timesteps.
+    # With shift_action=True and use_history_action=False, the trajectory becomes
+    # nactions[:, T//2-1:-1] where T=8 (image frames), i.e. nactions[:, 3:-1].
+    # To get 16 actions after slicing: len(nactions) - 3 - 1 = 16 → len(nactions) = 20
+    return list(range(-3, 17))  # 20 action frames: indices -3 to 16 inclusive
 
 
 @dataclass
@@ -61,6 +68,8 @@ class UVALeRobotDataset(Dataset):
         Fraction of frames used for training when `split="train"`.
     split: str
         'train' or 'val'. Split is performed by slicing the dataset length.
+    target_image_size: int
+        Target image size (square) for resizing. UVA expects 256x256 by default.
     """
 
     repo_id: str
@@ -71,10 +80,25 @@ class UVALeRobotDataset(Dataset):
     action_delta_indices: Sequence[int] = None  # type: ignore[assignment]
     split_ratio: float = 0.95
     split: str = "train"
+    target_image_size: int = UVA_DEFAULT_IMAGE_SIZE
 
     def __post_init__(self):
         meta = LeRobotDatasetMetadata(self.repo_id, root=self.root)
         fps = meta.fps
+
+        # Validate provided feature keys early to give actionable errors.
+        if self.image_key not in meta.features:
+            image_keys = [k for k in meta.features if "image" in k]
+            raise ValueError(
+                f"image_key '{self.image_key}' not found in dataset features. "
+                f"Available image-like keys: {image_keys}"
+            )
+        if self.action_key not in meta.features:
+            action_keys = [k for k in meta.features if "action" in k]
+            raise ValueError(
+                f"action_key '{self.action_key}' not found in dataset features. "
+                f"Available action-like keys: {action_keys}"
+            )
 
         img_idx = list(_default_image_indices() if self.image_delta_indices is None else self.image_delta_indices)
         act_idx = list(_default_action_indices() if self.action_delta_indices is None else self.action_delta_indices)
@@ -123,7 +147,18 @@ class UVALeRobotDataset(Dataset):
         if actions.ndim == 1:  # fallback when delta_timestamps not provided for action
             actions = actions.unsqueeze(0)
 
-        obs = {"image": images.float()}
+        # Resize images to target size if needed (UVA expects 256x256 by default)
+        images = images.float()
+        _, _, h, w = images.shape
+        if h != self.target_image_size or w != self.target_image_size:
+            images = F.interpolate(
+                images,
+                size=(self.target_image_size, self.target_image_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        obs = {"image": images}
         # Optional: provide the sampled frame indices so UVA can skip its own subsampling.
         obs["img_indices"] = torch.tensor(self.image_delta_indices, dtype=torch.float32).view(-1, 1)
         return {
@@ -140,6 +175,10 @@ class UVALeRobotDataset(Dataset):
 
     @property
     def image_shape(self) -> tuple[int, int, int]:
+        """Return (C, H, W) after resizing to target_image_size."""
         feat = self.meta.features[self.image_key]
-        shape = feat["shape"]  # [C, H, W]
-        return tuple(shape)
+        shape = feat["shape"]  # [H, W, C] or [C, H, W] depending on dataset
+        # LeRobot stores as [H, W, C] in metadata but returns [C, H, W] tensors
+        # We return the shape after resize: (C, target_size, target_size)
+        c = shape[2] if len(shape) == 3 and shape[2] <= 4 else shape[0]
+        return (c, self.target_image_size, self.target_image_size)

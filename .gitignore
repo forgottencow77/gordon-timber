@@ -1,1 +1,5 @@
 .DS_Store
+
+# Pretrained/downloaded model weights
+lerobot/pretrained_models/
+unified_video_action/pretrained_models/

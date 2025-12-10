@@ -1,18 +1,25 @@
 #!/usr/bin/env python
 #
-# Evaluate a UVA checkpoint on a LeRobot v3 dataset (SO-101 default).
-# Computes average training loss over the validation split.
+# Run UVA policy in inference mode and dump predicted actions (and optionally input frames).
+#
+# Example:
+#   python src/lerobot/scripts/show_uva_predictions.py \\
+#       --checkpoint outputs/uva_so101/epoch0010.pt \\
+#       --repo_id tenkau/record-test \\
+#       --image_key observation.images.laptop \\
+#       --max_batches 2 --save_frames --device cuda
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader
 from omegaconf import DictConfig, ListConfig, OmegaConf
-from tqdm import tqdm
+from torch.utils.data import DataLoader
+from torchvision.utils import save_image
 
 from lerobot.uva_bridge.dataset import UVALeRobotDataset, _default_action_indices, _default_image_indices
 
@@ -58,14 +65,12 @@ def build_shape_meta(image_shape, action_dim, img_len, act_len):
     )
 
 
-def format_batch(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
-    obs = {k: v.to(device=device, dtype=torch.float32) for k, v in batch["obs"].items()}
-    action = batch["action"].to(device=device, dtype=torch.float32)
-    return {"obs": obs, "action": action}
+def tensor_to_list(t: torch.Tensor) -> list:
+    return t.detach().cpu().tolist()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate UVA checkpoint on a LeRobot dataset.")
+    parser = argparse.ArgumentParser(description="Inspect UVA policy outputs on a few batches.")
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--repo_id", required=True)
     parser.add_argument("--root", default=None)
@@ -73,9 +78,12 @@ def main():
     parser.add_argument("--action_key", default="action")
     parser.add_argument("--image_indices", nargs="+", type=int, default=None)
     parser.add_argument("--action_indices", nargs="+", type=int, default=None)
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--max_batches", type=int, default=1, help="Number of batches to sample for inspection.")
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--save_frames", action="store_true", help="Save the input frames used for each sample.")
+    parser.add_argument("--out_dir", type=Path, default=Path("uva_outputs"))
     parser.add_argument(
         "--weights_only",
         action="store_true",
@@ -87,9 +95,15 @@ def main():
     repo_root = _resolve_repo_root()
     uva_root = _add_uva_to_path(repo_root)
     from unified_video_action.policy.unified_video_action_policy import UnifiedVideoActionPolicy
+
     policy_defaults = OmegaConf.load(uva_root / "unified_video_action" / "config" / "model" / "uva.yaml").policy
 
-    image_indices = args.image_indices if args.image_indices is not None else _default_image_indices()
+    if args.image_indices is not None:
+        image_indices = args.image_indices
+    else:
+        # The UVA config expects 4 conditioning frames (see uva.yaml comment).
+        default_img_idx = _default_image_indices()
+        image_indices = default_img_idx[:4] if len(default_img_idx) > 4 else default_img_idx
     action_indices = args.action_indices if args.action_indices is not None else _default_action_indices()
 
     val_ds = UVALeRobotDataset(
@@ -101,7 +115,7 @@ def main():
         action_delta_indices=action_indices,
         split="val",
     )
-    val_loader = DataLoader(
+    loader = DataLoader(
         val_ds,
         batch_size=args.batch_size,
         shuffle=False,
@@ -138,23 +152,58 @@ def main():
     }
 
     device = torch.device(args.device)
-    policy = UnifiedVideoActionPolicy(**policy_kwargs).to(device)
+    policy = UnifiedVideoActionPolicy(**policy_kwargs).to(device).eval()
 
     if args.weights_only:
         torch.serialization.add_safe_globals([DictConfig, ListConfig])
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=args.weights_only or False)
     policy.load_state_dict(ckpt["model_state"], strict=False)
-    policy.eval()
 
-    losses: list[float] = []
-    with torch.no_grad():
-        for batch in tqdm(val_loader, desc="eval"):
-            batch = format_batch(batch, device=device)
-            loss, _ = policy(batch)
-            losses.append(loss.item())
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    json_path = args.out_dir / "predictions.jsonl"
+    records: list[dict] = []
 
-    avg = sum(losses) / max(1, len(losses))
-    print(f"Average loss on split 'val': {avg:.4f} over {len(losses)} batches")
+    for batch_idx, batch in enumerate(loader):
+        if batch_idx >= args.max_batches:
+            break
+        obs = {k: v.to(device) for k, v in batch["obs"].items()}
+        gt_action = batch["action"].to(device)
+
+        with torch.no_grad():
+            out = policy.predict_action(obs)
+
+        pred_action = out["action"]  # (B, n_action_steps, Da)
+        # Align shapes for metrics: clamp to shared length
+        shared_steps = min(gt_action.shape[1], pred_action.shape[1])
+        shared_gt = gt_action[:, :shared_steps]
+        shared_pred = pred_action[:, :shared_steps]
+        mae = torch.mean(torch.abs(shared_gt - shared_pred)).item()
+        mse = torch.mean((shared_gt - shared_pred) ** 2).item()
+
+        rec = {
+            "batch_index": batch_idx,
+            "gt_action_shape": list(gt_action.shape),
+            "pred_action_shape": list(pred_action.shape),
+            "mae": mae,
+            "mse": mse,
+            "gt_action": tensor_to_list(gt_action),
+            "pred_action": tensor_to_list(pred_action),
+        }
+        records.append(rec)
+        print(f"[batch {batch_idx}] mae={mae:.4f} mse={mse:.4f} gt_shape={tuple(gt_action.shape)} pred_shape={tuple(pred_action.shape)}")
+
+        if args.save_frames:
+            frames = obs["image"]  # (B, T, C, H, W)
+            frames_path = args.out_dir / f"batch{batch_idx:04d}_frames.png"
+            # Flatten time into grid row to see all frames
+            frames_flat = frames.flatten(0, 1)
+            save_image(frames_flat, str(frames_path), nrow=frames.shape[1])
+            print(f"  saved input frames -> {frames_path}")
+
+    with json_path.open("w") as f:
+        for rec in records:
+            f.write(json.dumps(rec) + "\n")
+    print(f"Wrote {len(records)} prediction records to {json_path}")
 
 
 if __name__ == "__main__":

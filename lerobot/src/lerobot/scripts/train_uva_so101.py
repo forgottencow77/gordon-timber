@@ -173,7 +173,7 @@ def main():
         "language_emb_model": None,
         # Use "umi" substring to reuse UVA image handling without extra keys.
         "task_name": "umi_so101",
-        "task_modes": ["policy_model"],
+        "task_modes": ["video_model","policy_model"],
         "normalizer_type": "none",
         # Match UVA default (None -> train all modes)
         "selected_training_mode": policy_defaults.selected_training_mode,
