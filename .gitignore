@@ -4,3 +4,4 @@
 lerobot/pretrained_models/
 unified_video_action/pretrained_models/
 *.pt
+*.ckpt

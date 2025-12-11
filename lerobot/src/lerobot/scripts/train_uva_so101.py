@@ -166,14 +166,14 @@ def main():
     policy_kwargs = {
         "vae_model_params": policy_defaults.vae_model_params,
         "autoregressive_model_params": policy_defaults.autoregressive_model_params,
-        "action_model_params": {**policy_defaults.action_model_params, "predict_action": True},
+        "action_model_params": {**policy_defaults.action_model_params, "predict_action": False},
         "shape_meta": shape_meta,
         "n_action_steps": policy_defaults.n_action_steps,
         "shift_action": True,
         "language_emb_model": None,
         # Use "umi" substring to reuse UVA image handling without extra keys.
         "task_name": "umi_so101",
-        "task_modes": ["video_model","policy_model"],
+        "task_modes": ["video_model"], #"policy_model"
         "normalizer_type": "none",
         # Match UVA default (None -> train all modes)
         "selected_training_mode": policy_defaults.selected_training_mode,
